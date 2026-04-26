@@ -1,0 +1,1362 @@
+\documentclass{RapportINPTCLOUD}
+
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\titleformat{\section}{\large\bfseries}{\thesection.}{0.5em}{}
+\titleformat{\subsection}{\normalsize\bfseries}{\thesubsection.}{0.5em}{}
+
+% Code listing style
+\lstdefinestyle{code}{
+  backgroundcolor=\color{gray!10},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray!40},
+  tabsize=2,
+  showstringspaces=false,
+  captionpos=b
+}
+
+% Report information
+\UE{Big Data -- INE2 2026}
+\sujet{Real-Time Streaming Pipeline}
+\titre{Lab 3 - Spark Streaming \& Kafka}
+\Encadrants{Pr. Hamid EL GHAZI}
+\eleves{Alae Eddine JAHID\\Anass FAJOUI}
+
+\begin{document}
+
+\fairemarges
+\fairepagedegarde
+\tabledematieres
+
+%---------------------------------------------------------------
+\section{Introduction}
+%---------------------------------------------------------------
+
+L'objectif de ce lab est de concevoir et mettre en \oe{}uvre un pipeline d'analytique financi\`{e}re \textbf{temps r\'{e}el} allant d'une API de donn\'{e}es de march\'{e} jusqu'\`{a} un tableau de bord interactif. Le flux logique est le suivant :
+
+\[
+\text{API financi\`{e}re} \rightarrow \text{Spark (Producer)} \rightarrow \text{Kafka} \rightarrow \text{Spark (Consumer)} \rightarrow \text{HDFS} \rightarrow \text{Superset}
+\]
+
+Contrairement au Lab 2 qui effectuait une extraction \textbf{batch} depuis MySQL, ce lab introduit le paradigme \textbf{streaming} : les donn\'{e}es arrivent en continu, sont trait\'{e}es au fil de l'eau par Spark Structured Streaming, et sont persist\'{e}es sur HDFS selon la m\^{e}me architecture Medallion (Bronze / Silver / Gold) que nous avons utilis\'{e}e pr\'{e}c\'{e}demment. La source de donn\'{e}es retenue est l'API publique REST de \textbf{Binance} (\texttt{api.binance.com/api/v3/ticker/24hr}) qui expose les donn\'{e}es de march\'{e} crypto en JSON sans authentification ni inscription pr\'{e}alable.
+
+\textbf{D\'{e}p\^{o}t du code.} L'int\'{e}gralit\'{e} du projet (\texttt{docker-compose.yml}, notebooks, scripts, rapport) est disponible publiquement \`{a}~:
+\begin{center}
+\url{https://github.com/Alae-J/labs-3-spark-streaming-kafka}
+\end{center}
+
+%---------------------------------------------------------------
+\section{PART 1 -- Environment Setup}
+%---------------------------------------------------------------
+
+\subsection{Q1 : R\^{o}les de chaque composant}
+
+Le pipeline repose sur quatre briques technologiques compl\'{e}mentaires, chacune ayant un r\^{o}le pr\'{e}cis :
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Kafka} -- \textit{Broker de messages} distribu\'{e} de type publish/subscribe. Il d\'{e}couple les producteurs (l'ingesteur d'API) des consommateurs (le job Spark). Les messages sont \textbf{durables}, \textbf{ordonn\'{e}s} au sein d'une partition, et \textbf{rejouables} \`{a} partir d'un offset ant\'{e}rieur. Kafka joue aussi le r\^{o}le de tampon qui absorbe les pics de producteur et permet aux consommateurs de rattraper leur retard.
+
+    \item \textbf{Spark Streaming (Structured Streaming)} -- \textit{Moteur de traitement de flux} distribu\'{e}. Il lit Kafka en micro-batches, applique des transformations DataFrame/SQL (filtrage, agr\'{e}gations fen\^{e}tr\'{e}es, jointures, moyennes mobiles) et \'{e}crit les r\'{e}sultats vers un sink (HDFS, un autre topic Kafka, une console). C'est la couche de \textit{calcul} du pipeline.
+
+    \item \textbf{HDFS} -- \textit{Syst\`{e}me de fichiers distribu\'{e}} servant de \textit{data lake}. Il stocke durablement les trois couches Medallion (Bronze, Silver, Gold) en Parquet. C'est le syst\`{e}me de r\'{e}f\'{e}rence interrog\'{e} ensuite par Superset.
+
+    \item \textbf{Superset} -- \textit{Plateforme de Business Intelligence}. Elle se connecte \`{a} un moteur SQL (Spark SQL, Trino, Hive), permet d'enregistrer des datasets, de cr\'{e}er des graphiques (s\'{e}ries temporelles, barres, moyennes mobiles) et de les combiner en tableaux de bord. C'est la couche de \textit{pr\'{e}sentation}.
+\end{itemize}
+
+\subsection{Q2 : Installation et d\'{e}marrage de l'environnement}
+
+L'ensemble de l'environnement est d\'{e}clar\'{e} dans un fichier \texttt{docker-compose.yml}. Par rapport au Lab 2, nous avons ajout\'{e} quatre services~:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Zookeeper} -- service de coordination requis par Kafka (\'{e}lection du leader, m\'{e}tadonn\'{e}es des partitions).
+    \item \textbf{Kafka broker} -- le broker de messages (\texttt{confluentinc/cp-kafka:7.5.0}).
+    \item \textbf{Kafka UI} -- interface web pour inspecter les topics, partitions, offsets et consumer groups.
+    \item \textbf{Superset} -- serveur BI (\texttt{apache/superset:3.1.1}) initialis\'{e} automatiquement avec un compte admin.
+\end{itemize}
+
+Tous les noms de conteneurs sont pr\'{e}fix\'{e}s par \texttt{lab3-} afin de ne pas entrer en conflit avec les labs pr\'{e}c\'{e}dents, et l'ensemble partage un r\'{e}seau Docker d\'{e}di\'{e} \texttt{lab3}.
+
+\begin{lstlisting}[style=code, language=bash, caption=docker-compose.yml (extrait)]
+version: "3.8"
+
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-namenode
+    hostname: namenode
+    ports: ["9870:9870"]
+
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-datanode1
+
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-datanode2
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: lab3-zookeeper
+    ports: ["2181:2181"]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: lab3-kafka
+    depends_on: [zookeeper]
+    ports: ["9092:9092", "29092:29092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: >-
+        PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: lab3-kafka-ui
+    ports: ["8085:8080"]
+
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-master
+    ports: ["7077:7077", "8080:8080"]
+
+  spark-worker1:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-worker1
+
+  spark-worker2:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-worker2
+
+  spark-client:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-client
+    volumes: [./scripts:/opt/scripts]
+    ports: ["4040:4040"]
+
+  superset:
+    image: apache/superset:3.1.1
+    container_name: lab3-superset
+    ports: ["8088:8088"]
+\end{lstlisting}
+
+Deux listeners Kafka sont d\'{e}finis~:
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{kafka:9092} -- utilis\'{e} par les conteneurs sur le r\'{e}seau \texttt{lab3} (jobs Spark, Superset).
+    \item \texttt{localhost:29092} -- utilis\'{e} depuis la machine h\^{o}te (producteur Python ex\'{e}cut\'{e} en dehors de Docker).
+\end{itemize}
+
+Lancement de la stack compl\`{e}te~:
+\begin{lstlisting}[style=code, language=bash]
+docker-compose up -d
+\end{lstlisting}
+
+Interfaces web disponibles apr\`{e}s d\'{e}marrage~:
+\begin{center}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Service} & \textbf{URL} \\
+\hline
+HDFS NameNode & \texttt{http://localhost:9870} \\
+Spark Master & \texttt{http://localhost:8080} \\
+Spark Application & \texttt{http://localhost:4040} \\
+Kafka UI & \texttt{http://localhost:8085} \\
+Superset & \texttt{http://localhost:8088} (admin / admin) \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Q3 : V\'{e}rification du bon fonctionnement}
+
+Chaque service est v\'{e}rifi\'{e} ind\'{e}pendamment avant de passer \`{a} la suite du lab.
+
+\textbf{V\'{e}rifier que Kafka fonctionne :}
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-kafka kafka-broker-api-versions \
+  --bootstrap-server kafka:9092
+\end{lstlisting}
+Le broker r\'{e}pond avec la liste de ses API support\'{e}es (\texttt{Produce}, \texttt{Fetch}, \texttt{Metadata}\dots). Une erreur de connexion signalerait que Zookeeper ou Kafka ne sont pas disponibles. L'interface Kafka UI (\texttt{localhost:8085}) affiche \'{e}galement l'\'{e}tat du cluster.
+
+\textbf{V\'{e}rifier que HDFS est accessible :}
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-namenode hdfs dfsadmin -report
+\end{lstlisting}
+La sortie attendue confirme la pr\'{e}sence de \textbf{2 DataNodes vivants} et la capacit\'{e} configur\'{e}e~:
+\begin{lstlisting}[style=code]
+Configured Capacity: 259795787776 (241.95 GB)
+DFS Used: 49152 (48 KB)
+Live datanodes (2):
+  Name: 172.X.X.X:9866 (datanode1)
+  Name: 172.X.X.X:9866 (datanode2)
+\end{lstlisting}
+L'UI HDFS (\texttt{localhost:9870}) dans l'onglet \textit{Datanodes} doit lister \texttt{datanode1} et \texttt{datanode2} avec le statut \textit{In service}.
+
+\textbf{V\'{e}rifier que Spark est correctement configur\'{e} :}
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-spark-client bash -c \
+  "echo 'println(spark.version)' | \
+   /opt/spark/bin/spark-shell \
+   --master spark://spark-master:7077"
+\end{lstlisting}
+La sortie attendue contient~:
+\begin{lstlisting}[style=code]
+Spark context available as 'sc'
+(master = spark://spark-master:7077, app id = app-20260423...)
+version 3.5.0
+Using Scala version 2.12.18, Java 11.0.20.1
+\end{lstlisting}
+L'UI du Spark Master (\texttt{localhost:8080}) doit \'{e}galement afficher les \textbf{2 Workers} enregistr\'{e}s.
+
+\textbf{V\'{e}rifier que Superset est op\'{e}rationnel :}
+\begin{lstlisting}[style=code, language=bash]
+curl -s -o /dev/null -w "%{http_code}\n" \
+  http://localhost:8088/health
+# -> 200
+\end{lstlisting}
+La page de connexion est accessible \`{a} \texttt{localhost:8088} avec les identifiants \texttt{admin} / \texttt{admin} cr\'{e}\'{e}s automatiquement par le conteneur au premier d\'{e}marrage.
+
+\subsection{Q4 : Cr\'{e}ation du topic Kafka \texttt{financial\_data}}
+
+Le topic Kafka est cr\'{e}\'{e} via l'outil en ligne de commande \texttt{kafka-topics} livr\'{e} avec l'image Confluent~:
+
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-kafka kafka-topics \
+  --bootstrap-server kafka:9092 \
+  --create \
+  --topic financial_data \
+  --partitions 3 \
+  --replication-factor 1 \
+  --config retention.ms=604800000
+\end{lstlisting}
+
+\textbf{Choix du nombre de partitions.} Nous avons retenu \textbf{3 partitions} pour les raisons suivantes~:
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Plafond de parall\'{e}lisme} -- le nombre de partitions fixe le nombre maximal de consommateurs \textit{actifs} au sein d'un m\^{e}me consumer group. Plus il y a de partitions, plus on peut paralléliser la consommation.
+    \item \textbf{Alignement avec la couche de calcul} -- notre cluster Spark dispose de 2 workers ; 3 partitions laissent \`{a} Spark une marge de parall\'{e}lisation sans pour autant fragmenter excessivement les donn\'{e}es.
+    \item \textbf{Alignement avec la cardinalit\'{e} des symboles} -- nous comptons streamer un petit panier de symboles (\texttt{BTCUSDT}, \texttt{ETHUSDT}, \texttt{SOLUSDT}). En utilisant le symbole comme \textbf{cl\'{e}} de message, Kafka garantit automatiquement que tous les ticks d'un m\^{e}me symbole atterrissent sur la \textit{m\^{e}me} partition, ce qui pr\'{e}serve leur ordre temporel.
+    \item \textbf{Pas de sur-provisionnement} -- sur un broker unique, une seule partition s\'{e}rialiserait toutes les lectures tandis qu'un nombre \'{e}lev\'{e} (30+) ajouterait de l'overhead de m\'{e}tadonn\'{e}es sans gain r\'{e}el. 3 est un bon compromis p\'{e}dagogique.
+\end{enumerate}
+
+Le facteur de r\'{e}plication est de \textbf{1} car nous n'avons qu'un seul broker. En production on utiliserait typiquement \texttt{replication-factor=3} r\'{e}parti sur 3 brokers pour tol\'{e}rer la perte d'un n\oe{}ud. La r\'{e}tention est fix\'{e}e \`{a} \textbf{7 jours} (\texttt{604800000 ms}), largement suffisante pour un lab et permettant de rejouer le flux si n\'{e}cessaire.
+
+\textbf{V\'{e}rification du topic cr\'{e}\'{e} :}
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-kafka kafka-topics \
+  --bootstrap-server kafka:9092 \
+  --describe --topic financial_data
+\end{lstlisting}
+Sortie obtenue~:
+\begin{lstlisting}[style=code]
+Topic: financial_data  PartitionCount: 3  ReplicationFactor: 1
+  Partition: 0  Leader: 1  Replicas: 1  Isr: 1
+  Partition: 1  Leader: 1  Replicas: 1  Isr: 1
+  Partition: 2  Leader: 1  Replicas: 1  Isr: 1
+\end{lstlisting}
+
+\textbf{Test end-to-end :} nous validons la plomberie Kafka en produisant un message puis en le consommant depuis le d\'{e}but~:
+\begin{lstlisting}[style=code, language=bash]
+# Produire un message
+echo '{"test":"hello from lab3"}' | \
+  docker exec -i lab3-kafka kafka-console-producer \
+    --bootstrap-server kafka:9092 --topic financial_data
+
+# Consommer le message
+docker exec lab3-kafka kafka-console-consumer \
+  --bootstrap-server kafka:9092 --topic financial_data \
+  --from-beginning --max-messages 1
+# -> {"test":"hello from lab3"}
+# -> Processed a total of 1 messages
+\end{lstlisting}
+Le message est bien r\'{e}cup\'{e}r\'{e} c\^{o}t\'{e} consommateur, confirmant que la cha\^{i}ne Zookeeper $\rightarrow$ Kafka $\rightarrow$ client fonctionne de bout en bout.
+
+%---------------------------------------------------------------
+\section{PART 2 -- Data Ingestion (Spark $\rightarrow$ Kafka)}
+%---------------------------------------------------------------
+
+\subsection{Environnement de d\'{e}veloppement : Jupyter Lab}
+
+Pour faciliter l'exp\'{e}rimentation it\'{e}rative, nous avons ajout\'{e} \`{a} la stack un service \textbf{Jupyter Lab} bas\'{e} sur l'image officielle \texttt{jupyter/pyspark-notebook:spark-3.5.0}. Toutes les op\'{e}rations des parties 2 et suivantes sont pilot\'{e}es depuis des notebooks \texttt{.ipynb} mont\'{e}s dans le conteneur :
+
+\begin{lstlisting}[style=code, language=bash, caption=Extrait docker-compose.yml -- service Jupyter]
+jupyter:
+  image: jupyter/pyspark-notebook:spark-3.5.0
+  container_name: lab3-jupyter
+  depends_on: [spark-master, kafka, namenode]
+  ports: ["8888:8888"]
+  volumes:
+    - ./notebooks:/home/jovyan/work/notebooks
+    - ./scripts:/home/jovyan/work/scripts
+  environment:
+    JUPYTER_TOKEN: lab3
+  command: >
+    bash -c "pip install --quiet --user requests kafka-python findspark &&
+             start-notebook.sh --ServerApp.token='lab3' --ServerApp.password=''"
+\end{lstlisting}
+
+Jupyter Lab est accessible \`{a} \texttt{http://localhost:8888} avec le token \texttt{lab3}. Le notebook \texttt{notebooks/02\_producer\_binance.ipynb} contient le producteur d\'{e}taill\'{e} ci-apr\`{e}s.
+
+\textbf{Note technique importante :} le conteneur Jupyter utilise Python 3.11 (via conda), alors que les Spark Workers (\texttt{apache/spark:3.5.0}) utilisent Python 3.8. PySpark exige que le driver et les executors partagent la m\^{e}me version mineure de Python. Par cons\'{e}quent, les notebooks s'ex\'{e}cutent en \textbf{mode local} (\texttt{master="local[*]"}) dans le conteneur Jupyter : le driver et les executors tournent dans le m\^{e}me processus, sans conflit. Le cluster distribu\'{e} reste disponible pour les jobs lourds soumis via \texttt{spark-submit} depuis le conteneur \texttt{lab3-spark-client}, qui utilise Python 3.8 compatible avec les workers. Pour les micro-batches de ce lab (5 lignes par it\'{e}ration), le mode local est en pratique le bon choix.
+
+\subsection{Q5 : Choix de l'API financi\`{e}re et champs pertinents}
+
+Nous avons retenu l'\textbf{API publique de Binance} (\texttt{api.binance.com} et son miroir \texttt{data-api.binance.vision}) pour les raisons suivantes :
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Sans authentification} -- les endpoints de donn\'{e}es de march\'{e} publiques ne requi\`{e}rent ni cl\'{e} API, ni inscription, ni carte bancaire. Id\'{e}al en contexte \'{e}tudiant.
+    \item \textbf{Limites de taux g\'{e}n\'{e}reuses} -- plusieurs milliers de requ\^{e}tes par minute par IP, largement suffisant pour polluer \`{a} 5~s.
+    \item \textbf{March\'{e} crypto 24/7} -- contrairement aux bourses actions, le march\'{e} crypto est toujours ouvert, donc le pipeline peut \^{e}tre d\'{e}montr\'{e} \`{a} tout moment.
+    \item \textbf{JSON propre} -- r\'{e}ponses directement exploitables par Spark.
+\end{itemize}
+
+L'endpoint utilis\'{e} est \texttt{GET /api/v3/ticker/24hr?symbol=BTCUSDT} qui renvoie une structure JSON riche. Nous en extrayons 4 champs suffisants pour toute l'analyse~:
+\begin{center}
+\begin{tabular}{|l|l|l|}
+\hline
+\textbf{Champ} & \textbf{Source Binance} & \textbf{Justification} \\
+\hline
+\texttt{symbol} & \texttt{symbol} & identifiant de l'actif (cl\'{e} Kafka) \\
+\texttt{price} & \texttt{lastPrice} & dernier prix tran\c{s}actionnel \\
+\texttt{volume} & \texttt{volume} & volume \'{e}chang\'{e} sur 24h \\
+\texttt{timestamp} & \texttt{closeTime} & horodatage en millisecondes (epoch) \\
+\hline
+\end{tabular}
+\end{center}
+
+Le panier de symboles suivi est \texttt{[BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, ADAUSDT]} -- un \'{e}chantillon repr\'{e}sentatif de cryptos majeures avec des ordres de grandeur de prix tr\`{e}s diff\'{e}rents (de \$0.55 pour ADA \`{a} \$77000 pour BTC), ce qui permettra d'illustrer le besoin de normalisation lors des agr\'{e}gations de Part 3.
+
+\subsection{Q6 : Job Spark qui r\'{e}cup\`{e}re les donn\'{e}es p\'{e}riodiquement}
+
+Le notebook \texttt{02\_producer\_binance.ipynb} d\'{e}finit un sch\'{e}ma Spark strict et une fonction \texttt{fetch\_ticker} qui effectue un appel REST pour un symbole~:
+
+\begin{lstlisting}[style=code, language=Python, caption=Sch\'{e}ma et helper REST]
+from pyspark.sql.types import StructType, StructField, \
+    StringType, DoubleType, LongType
+
+SCHEMA = StructType([
+    StructField("symbol",    StringType(), False),
+    StructField("price",     DoubleType(), False),
+    StructField("volume",    DoubleType(), False),
+    StructField("timestamp", LongType(),   False),
+])
+
+def fetch_ticker(symbol: str) -> dict:
+    r = requests.get(
+        "https://api.binance.com/api/v3/ticker/24hr",
+        params={"symbol": symbol}, timeout=5)
+    r.raise_for_status()
+    d = r.json()
+    return {
+        "symbol":    d["symbol"],
+        "price":     float(d["lastPrice"]),
+        "volume":    float(d["volume"]),
+        "timestamp": int(d["closeTime"]),
+    }
+\end{lstlisting}
+
+La session Spark est cr\'{e}\'{e}e avec le connecteur Kafka en tant que d\'{e}pendance Maven -- Spark le t\'{e}l\'{e}charge automatiquement au premier appel puis le met en cache dans \texttt{\~{}/.ivy2/}~:
+
+\begin{lstlisting}[style=code, language=Python]
+import findspark; findspark.init()
+from pyspark.sql import SparkSession
+
+spark = (SparkSession.builder
+    .appName("BinanceToKafkaProducer")
+    .master("local[*]")
+    .config("spark.jars.packages",
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0")
+    .getOrCreate())
+\end{lstlisting}
+
+\subsection{Q7 : Conversion au format JSON et envoi \`{a} Kafka}
+
+L'API Kafka de Spark attend un DataFrame \`{a} deux colonnes \texttt{key} et \texttt{value} (chaque valeur \'{e}tant une cha\^{i}ne ou un tableau d'octets). Nous convertissons donc chaque enregistrement en JSON via la fonction \texttt{to\_json(struct(...))} et utilisons le \textbf{symbole} comme cl\'{e} pour assurer que tous les ticks d'un m\^{e}me actif atterrissent sur la m\^{e}me partition (pr\'{e}servation de l'ordre par symbole) :
+
+\begin{lstlisting}[style=code, language=Python, caption=Boucle de polling et envoi \`{a} Kafka]
+from pyspark.sql.functions import col, struct, to_json
+import time
+
+while True:
+    records = [fetch_ticker(s) for s in SYMBOLS]
+    df = spark.createDataFrame(records, schema=SCHEMA)
+
+    out = df.select(
+        col("symbol").cast("string").alias("key"),
+        to_json(struct("symbol","price","volume","timestamp"))
+          .alias("value"),
+    )
+
+    (out.write
+        .format("kafka")
+        .option("kafka.bootstrap.servers", "kafka:9092")
+        .option("topic", "financial_data")
+        .save())
+
+    time.sleep(5)
+\end{lstlisting}
+
+\textbf{Test end-to-end r\'{e}ussi.} Apr\`{e}s une it\'{e}ration r\'{e}elle, nous avons consomm\'{e} le topic pour v\'{e}rifier la r\'{e}ception des messages (sortie tronqu\'{e}e) :
+
+\begin{lstlisting}[style=code]
+ETHUSDT | {"symbol":"ETHUSDT","price":2313.57,
+           "volume":372630.82,"timestamp":1776940116013}
+ADAUSDT | {"symbol":"ADAUSDT","price":0.2455,
+           "volume":1.14054E8,"timestamp":1776940117003}
+BTCUSDT | {"symbol":"BTCUSDT","price":77379.31,
+           "volume":18422.16,"timestamp":1776940115002}
+BNBUSDT | {"symbol":"BNBUSDT","price":631.52,
+           "volume":127307.82,"timestamp":1776940117008}
+SOLUSDT | {"symbol":"SOLUSDT","price":85.38,
+           "volume":2595530.01,"timestamp":1776940116625}
+\end{lstlisting}
+
+La cl\'{e} \`{a} gauche (\texttt{ETHUSDT}, \texttt{ADAUSDT}, \ldots) correspond bien au symbole ; chaque valeur est un document JSON conforme au sch\'{e}ma.
+
+\subsection{Q8 : Structure d'un message Kafka}
+
+Un message Kafka est une structure en 6 champs :
+
+\begin{center}
+\begin{tabular}{|l|p{8.3cm}|}
+\hline
+\textbf{Champ} & \textbf{R\^{o}le} \\
+\hline
+\texttt{key} & Cl\'{e} (bytes). D\'{e}termine la partition via hachage. Chez nous = symbole. \\
+\texttt{value} & Payload m\'{e}tier (bytes). Chez nous = JSON s\'{e}rialis\'{e}. \\
+\texttt{topic} & Nom du topic cible (\texttt{financial\_data}). \\
+\texttt{partition} & Index de la partition (0, 1, ou 2). Attribu\'{e} par Kafka en fonction de la cl\'{e}. \\
+\texttt{offset} & Position s\'{e}quentielle dans la partition. Immuable. \\
+\texttt{timestamp} & Horodatage cr\'{e}\'{e} par le producteur ou par le broker. \\
+\hline
+\end{tabular}
+\end{center}
+
+Les \texttt{headers} optionnels (cl\'{e}-valeur, comme des headers HTTP) peuvent transporter des m\'{e}ta-donn\'{e}es techniques (version du sch\'{e}ma, correlation-id) ; nous ne les utilisons pas dans ce lab.
+
+\subsection{Q9 : Tol\'{e}rance aux pannes et coh\'{e}rence des donn\'{e}es}
+
+\textbf{Tol\'{e}rance aux pannes.} Elle repose sur trois m\'{e}canismes compl\'{e}mentaires :
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{R\'{e}plication Kafka} -- en production, chaque partition est r\'{e}pliqu\'{e}e sur $N$ brokers (\texttt{replication-factor=3} typique). Si un broker tombe, un suiveur \textit{in-sync} prend le relais comme leader. Notre lab n'a qu'un broker (\texttt{replication-factor=1}), donc ce filet de s\'{e}curit\'{e} est d\'{e}sactiv\'{e} ; on le documente sans le d\'{e}montrer.
+    \item \textbf{Durabilit\'{e} c\^{o}t\'{e} producteur} -- le connecteur Kafka de Spark attend par d\'{e}faut l'\texttt{ack} du broker avant de consid\'{e}rer l'\'{e}criture comme r\'{e}ussie. Une configuration plus stricte passerait par \texttt{kafka.acks="all"} (attente de l'\texttt{ack} de tous les replicas in-sync) et \texttt{kafka.retries=N} (r\'{e}\'{e}mission automatique en cas d'erreur transitoire), \`{a} sp\'{e}cifier dans les options du \texttt{.write.format("kafka")}.
+    \item \textbf{Commit d'offsets c\^{o}t\'{e} consommateur} -- le job consommateur Spark (Part 3) s'appuiera sur un \texttt{checkpointLocation} HDFS pour persister les offsets consomm\'{e}s et les garanties de progression ; en cas de crash, le job reprend exactement l\`{a} o\`{u} il s'\'{e}tait arr\^{e}t\'{e}.
+\end{itemize}
+
+\textbf{Coh\'{e}rence des donn\'{e}es.} Elle est assur\'{e}e par :
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Ordre par cl\'{e}} -- Kafka garantit l'ordre des messages \textit{au sein d'une m\^{e}me partition}. En utilisant \texttt{symbol} comme cl\'{e}, tous les ticks d'un m\^{e}me actif sont lin\'{e}aris\'{e}s dans le temps.
+    \item \textbf{Sch\'{e}ma strict} -- notre \texttt{StructType} rejette toute ligne mal form\'{e}e (type incorrect, champ manquant) d\`{e}s l'\'{e}criture, ce qui \'{e}vite qu'un tick corrompu pollue le topic.
+    \item \textbf{S\'{e}mantique at-least-once} -- par d\'{e}faut, le producteur peut r\'{e}\'{e}mettre un message en cas de doute sur la r\'{e}ception de l'\texttt{ack}, ce qui peut produire des doublons ; ceux-ci sont \'{e}limin\'{e}s en Part 3 via \texttt{dropDuplicates} sur \texttt{(symbol, timestamp)}. Pour exactly-once, Kafka offre la propri\'{e}t\'{e} \texttt{enable.idempotence=true} c\^{o}t\'{e} producteur et les transactions c\^{o}t\'{e} consommateur/producteur, que nous n'activons pas dans ce lab mais mentionnons pour compl\'{e}tude.
+\end{itemize}
+
+%---------------------------------------------------------------
+\section{PART 3 -- Stream Processing (Kafka $\rightarrow$ Spark)}
+%---------------------------------------------------------------
+
+Tout le traitement de flux est contenu dans le notebook \texttt{notebooks/03\_stream\_processor.ipynb}. Il s'ex\'{e}cute en parall\`{e}le du producteur (Part 2) : le producteur continue d'alimenter le topic pendant que le consommateur en lit le flux en continu.
+
+\subsection{Q10 : Lecture du topic Kafka avec Spark Structured Streaming}
+
+Spark Structured Streaming traite les sources Kafka comme des tables infinies : chaque nouveau message ajoute une ligne. La lecture se fait via \texttt{spark.readStream.format("kafka")} avec les m\^{e}mes options qu'en batch, plus \texttt{startingOffsets} qui contr\^{o}le le point de d\'{e}part :
+
+\begin{lstlisting}[style=code, language=Python, caption=Lecture streaming de Kafka]
+raw = (spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "kafka:9092")
+    .option("subscribe", "financial_data")
+    .option("startingOffsets", "latest")
+    .load())
+\end{lstlisting}
+
+Le DataFrame \texttt{raw} a un sch\'{e}ma impos\'{e} par Kafka : \texttt{key (binary)}, \texttt{value (binary)}, \texttt{topic}, \texttt{partition}, \texttt{offset}, \texttt{timestamp}, \texttt{timestampType}. La valeur m\'{e}tier se trouve dans \texttt{value} sous forme d'octets -- il faut la d\'{e}coder et parser le JSON.
+
+\subsection{Q11 : Sch\'{e}ma appliqu\'{e} aux donn\'{e}es JSON entrantes}
+
+Structured Streaming \textbf{n'infere pas} de sch\'{e}ma sur un flux (contrairement \`{a} \texttt{spark.read.json}). Nous devons le fournir explicitement -- c'est le m\^{e}me que celui utilis\'{e} par le producteur, ce qui garantit une correspondance parfaite :
+
+\begin{lstlisting}[style=code, language=Python]
+from pyspark.sql.types import StructType, StructField, \
+    StringType, DoubleType, LongType
+from pyspark.sql.functions import col, from_json, from_unixtime
+
+SCHEMA = StructType([
+    StructField("symbol",    StringType(), False),
+    StructField("price",     DoubleType(), False),
+    StructField("volume",    DoubleType(), False),
+    StructField("timestamp", LongType(),   False),
+])
+
+parsed = (raw
+    .selectExpr("CAST(value AS STRING) AS json_str")
+    .select(from_json(col("json_str"), SCHEMA).alias("d"))
+    .select("d.symbol", "d.price", "d.volume", "d.timestamp")
+    .withColumn("event_time",
+        from_unixtime(col("timestamp") / 1000).cast("timestamp")))
+\end{lstlisting}
+
+La fonction \texttt{from\_json} tente de parser chaque \texttt{value} selon le sch\'{e}ma. Si une ligne est mal form\'{e}e, les champs sont remplis avec \texttt{null}, ce qui permet de la filtrer ensuite. On ajoute une colonne \texttt{event\_time} de type \texttt{Timestamp} construite \`{a} partir du champ \texttt{timestamp} du producteur (en millisecondes epoch) -- indispensable pour les fen\^{e}tres temporelles et les watermarks.
+
+\subsection{Q12 : Transformations de flux}
+
+Trois transformations obligatoires par l'\'{e}nonc\'{e} sont implant\'{e}es.
+
+\textbf{Transformation 1 -- Filtrage des valeurs anormales.} Deux garde-fous sont appliqu\'{e}s :
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Cordons de s\'{e}curit\'{e} basiques} -- rejet des prix n\'{e}gatifs ou nuls, volumes n\'{e}gatifs.
+    \item \textbf{Bandes par symbole} -- chaque symbole connu a un prix d'ancrage approximatif (\texttt{ANCHOR}) ; un tick dont le prix sort de l'intervalle $[0.3 \times \text{anchor}, 3.0 \times \text{anchor}]$ est consid\'{e}r\'{e} comme aberrant. Ces bandes larges laissent passer la volatilit\'{e} normale du march\'{e} tout en capturant les vraies erreurs (spike $\times 10$, crash $\times 0.1$).
+\end{enumerate}
+
+\begin{lstlisting}[style=code, language=Python, caption=Filtre des valeurs anormales]
+from pyspark.sql.functions import lit, when
+
+ANCHOR = {"BTCUSDT":77000.0, "ETHUSDT":2300.0,
+          "SOLUSDT":85.0, "BNBUSDT":630.0, "ADAUSDT":0.25}
+LOWER, UPPER = 0.3, 3.0
+
+anchor_expr = None
+for sym, px in ANCHOR.items():
+    branch = when(col("symbol") == sym, lit(px))
+    anchor_expr = branch if anchor_expr is None \
+                  else anchor_expr.when(col("symbol") == sym, lit(px))
+anchor_expr = anchor_expr.otherwise(lit(None))
+
+clean = (parsed
+    .withColumn("anchor_px", anchor_expr)
+    .filter(col("price") > 0)
+    .filter(col("volume") >= 0)
+    .filter(col("anchor_px").isNull() |
+           ((col("price") >= col("anchor_px") * LOWER) &
+            (col("price") <= col("anchor_px") * UPPER)))
+    .drop("anchor_px"))
+\end{lstlisting}
+
+\textbf{Transformation 2 -- Moyenne mobile.} Fen\^{e}tre glissante de 1 minute avan\c{c}ant toutes les 10 secondes, group\'{e}e par symbole. Chaque tick contribue \`{a} plusieurs fen\^{e}tres simultan\'{e}ment (6 fen\^{e}tres actives \`{a} tout instant par symbole). Un \textbf{watermark} de 2 minutes indique \`{a} Spark qu'on peut ignorer les donn\'{e}es retardataires au-del\`{a} de 2 min.
+
+\begin{lstlisting}[style=code, language=Python, caption=Moyenne mobile glissante]
+from pyspark.sql.functions import window, avg, count
+
+moving_avg = (clean
+    .withWatermark("event_time", "2 minutes")
+    .groupBy(
+        window(col("event_time"), "1 minute", "10 seconds"),
+        col("symbol"))
+    .agg(
+        avg("price").alias("avg_price"),
+        count("*").alias("n_ticks"))
+    .select("symbol", "window.start", "window.end",
+            "avg_price", "n_ticks"))
+\end{lstlisting}
+
+\textbf{Transformation 3 -- Agr\'{e}gation par symbole.} Agr\'{e}gation running (sans fen\^{e}tre) depuis le d\'{e}but du flux : pour chaque symbole, min/max/avg du prix, somme des volumes, nombre de ticks.
+
+\begin{lstlisting}[style=code, language=Python, caption=Agr\'{e}gation par symbole]
+from pyspark.sql.functions import min as _min, max as _max, sum as _sum
+
+per_symbol = (clean.groupBy("symbol").agg(
+    _min("price").alias("min_price"),
+    _max("price").alias("max_price"),
+    avg("price").alias("avg_price"),
+    _sum("volume").alias("total_volume"),
+    count("*").alias("n_ticks")))
+\end{lstlisting}
+
+\textbf{R\'{e}sultat observ\'{e}.} Apr\`{e}s 45~s de flux r\'{e}el (test end-to-end contre Binance), voici une sortie repr\'{e}sentative de l'agr\'{e}gation par symbole (batch 4, sink console) :
+
+\begin{lstlisting}[style=code]
++-------+---------+---------+----------+--------------+-------+
+|symbol |min_price|max_price|avg_price |total_volume  |n_ticks|
++-------+---------+---------+----------+--------------+-------+
+|BTCUSDT|77370.0  |77393.56 |77385.705 |110550.96     |6      |
+|BNBUSDT|  631.9  |  632.07 |  632.015 |765668.00     |6      |
+|SOLUSDT|   85.38 |   85.41 |   85.397 | 15546465.30  |6      |
+|ADAUSDT|    0.2456|   0.2457|   0.24562|681859467.9   |6      |
+|ETHUSDT| 2312.75 | 2313.42 | 2313.183 |2247153.67    |6      |
++-------+---------+---------+----------+--------------+-------+
+\end{lstlisting}
+
+Les 5 symboles sont tous pr\'{e}sents, aucune valeur aberrante n'a \'{e}t\'{e} d\'{e}tect\'{e}e dans ce \'{e}chantillon (le march\'{e} \'{e}tait calme), ce qui est le comportement attendu.
+
+\subsection{Q13 : Diff\'{e}rence entre batch et Structured Streaming}
+
+\begin{center}
+\begin{tabular}{|p{3.2cm}|p{5.3cm}|p{5.3cm}|}
+\hline
+\textbf{Crit\`{e}re} & \textbf{Batch (\texttt{spark.read})} & \textbf{Structured Streaming (\texttt{spark.readStream})} \\
+\hline
+Source & Dataset fini (fichier, table) & Table infinie (Kafka, socket, fichiers qui apparaissent) \\
+\hline
+Ex\'{e}cution & Une fois, traite toutes les lignes, s'arr\^{e}te & Continue, traite les nouvelles lignes au fur et \`{a} mesure \\
+\hline
+Schema inference & Optionnel & Obligatoire (fourni par l'utilisateur) \\
+\hline
+Trigger & N/A & \texttt{ProcessingTime(n)}, \texttt{Once}, \texttt{Available now}, \texttt{Continuous} \\
+\hline
+Output modes & \texttt{overwrite}, \texttt{append} & \texttt{append}, \texttt{update}, \texttt{complete} \\
+\hline
+Tol\'{e}rance aux pannes & Reprise du job entier & Reprise au dernier offset valid\'{e} via \texttt{checkpointLocation} \\
+\hline
+Fen\^{e}tres temporelles & N/A (ou via groupBy temporel) & Natives (\texttt{window(\dots)}) avec gestion explicite de l'\textit{event time} et du watermark \\
+\hline
+\end{tabular}
+\end{center}
+
+Une cons\'{e}quence importante : \textbf{l'API DataFrame est identique} entre les deux modes (\texttt{select}, \texttt{filter}, \texttt{groupBy}, \texttt{join}\dots). Un script peut souvent passer de batch \`{a} streaming en ne changeant que \texttt{read} en \texttt{readStream} et en ajoutant un trigger.
+
+\subsection{Q14 : Gestion des donn\'{e}es en retard et reprise apr\`{e}s panne}
+
+\textbf{Donn\'{e}es en retard (late data).} Elles arrivent apr\`{e}s leur temps \'{e}v\'{e}nement cens\'{e} -- par exemple \`{a} cause d'une latence r\'{e}seau c\^{o}t\'{e} producteur, ou d'un buffer Kafka saturant. Spark traite ce probl\`{e}me via deux m\'{e}canismes :
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Watermark} (\texttt{withWatermark("event\_time", "2 minutes")}) -- indique \`{a} Spark le seuil au-del\`{a} duquel une donn\'{e}e est trop ancienne pour \^{e}tre int\'{e}gr\'{e}e dans une agr\'{e}gation. Concr\`{e}tement, si le dernier \texttt{event\_time} vu est $T$, toute nouvelle ligne avec \texttt{event\_time} $< T - 2\text{min}$ est ignor\'{e}e.
+    \item \textbf{State store} -- entre le watermark et l'horizon courant, Spark conserve l'\'{e}tat des fen\^{e}tres ouvertes. Une donn\'{e}e late qui tombe dans une fen\^{e}tre encore ouverte \textbf{met \`{a} jour} l'agr\'{e}gat correspondant (mode \texttt{update}), sinon elle est abandonn\'{e}e.
+\end{itemize}
+
+Le choix du watermark est un compromis : trop court $\rightarrow$ on perd des donn\'{e}es l\'{e}gitimement retard\'{e}es ; trop long $\rightarrow$ l'\'{e}tat en m\'{e}moire cro\^{i}t sans cesse.
+
+\textbf{Reprise apr\`{e}s panne (fault recovery).} Chaque query streaming d\'{e}finit un r\'{e}pertoire \texttt{checkpointLocation} o\`{u} Spark persiste trois types d'information :
+\begin{enumerate}[leftmargin=2em]
+    \item les \textbf{offsets Kafka} consomm\'{e}s (jusqu'o\`{u} on en est) ;
+    \item l'\textbf{\'{e}tat des agr\'{e}gats} en cours (pour les queries avec \texttt{groupBy}) ;
+    \item les \textbf{m\'{e}tadonn\'{e}es de commit} de chaque micro-batch.
+\end{enumerate}
+
+\begin{lstlisting}[style=code, language=Python, caption=Query streaming avec checkpoint]
+q = (per_symbol.writeStream
+    .format("console")
+    .outputMode("complete")
+    .option("checkpointLocation", "/tmp/lab3_ckpt/per_symbol")
+    .trigger(processingTime="10 seconds")
+    .queryName("per_symbol_console")
+    .start())
+\end{lstlisting}
+
+Si le job plante (par exemple le conteneur Spark est tu\'{e}), il suffit de relancer le m\^{e}me script : Spark inspecte le r\'{e}pertoire de checkpoint, reprend aux offsets non commit\'{e}s et reconstitue l'\'{e}tat des agr\'{e}gats. La garantie offerte est \textbf{exactly-once} pour le calcul des agr\'{e}gats (grace au state store transactionnel) et \textbf{at-least-once} pour la livraison vers un sink non-transactionnel comme la console ou Parquet -- ce qui explique pourquoi la d\'{e}duplication reste une bonne pratique en aval (\texttt{dropDuplicates} sur \texttt{(symbol, timestamp)}).
+
+En Part 4 nous remplacerons le sink console par un sink \textbf{Parquet sur HDFS} pour persister les couches Bronze/Silver/Gold du data lake.
+
+%---------------------------------------------------------------
+\section{PART 4 -- Data Storage (Spark $\rightarrow$ HDFS)}
+%---------------------------------------------------------------
+
+Le notebook \texttt{notebooks/04\_hdfs\_medallion.ipynb} reprend la logique streaming de Part 3 mais remplace les sinks console par \textbf{trois sinks Parquet sur HDFS}, chacun correspondant \`{a} une couche Medallion. Les trois queries s'ex\'{e}cutent \textit{simultan\'{e}ment} dans la m\^{e}me SparkSession, chacune avec son propre \texttt{checkpointLocation} dans HDFS.
+
+Avant le premier d\'{e}marrage, on cr\'{e}e la racine \texttt{/lab3} dans HDFS avec des droits ouverts pour que l'utilisateur \texttt{jovyan} du conteneur Jupyter puisse \'{e}crire~:
+
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-namenode hdfs dfs -mkdir -p \
+  /lab3/bronze /lab3/silver /lab3/gold /lab3/checkpoints
+docker exec lab3-namenode hdfs dfs -chmod -R 777 /lab3
+\end{lstlisting}
+
+\subsection{Q15 : Format de fichier choisi -- Parquet}
+
+Nous utilisons \textbf{Apache Parquet} (avec compression \textbf{Snappy} par d\'{e}faut) pour les trois couches. Les raisons principales :
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Format colonnaire} -- les donn\'{e}es sont stock\'{e}es par colonne plut\^{o}t que par ligne. Une requ\^{e}te \og moyenne du \texttt{price} par \texttt{symbol}\fg{} ne lit que deux colonnes du fichier, sans charger \texttt{volume}, \texttt{timestamp}, etc.
+    \item \textbf{Compression native} -- Snappy donne un bon compromis vitesse/taille ; les m\^{e}mes donn\'{e}es CSV auraient \'{e}t\'{e} $\sim$3 \`{a} 5 fois plus volumineuses.
+    \item \textbf{Sch\'{e}ma embarqu\'{e}} -- types (Double, Long, String\dots) conserv\'{e}s dans le fichier. Pas de parsing/inf\'{e}rence comme avec CSV.
+    \item \textbf{Predicate pushdown} -- Spark peut envoyer des filtres au lecteur Parquet qui saute des row-groups entiers sans les d\'{e}compresser (\og where symbol='BTCUSDT'\fg{}).
+    \item \textbf{Evolvable} -- on peut ajouter ou retirer des colonnes sans casser les lecteurs existants.
+\end{itemize}
+
+Comparaison rapide avec les alternatives typiques :
+\begin{center}
+\begin{tabular}{|l|l|p{7cm}|}
+\hline
+\textbf{Format} & \textbf{Verdict} & \textbf{Commentaire} \\
+\hline
+\textbf{Parquet} & \textbf{Choisi} & Colonnaire, compress\'{e}, sch\'{e}ma, pushdown. \\
+ORC & Valable & Tr\`{e}s proche de Parquet, mieux int\'{e}gr\'{e} c\^{o}t\'{e} Hive/ACID. \\
+CSV & Rejet\'{e} & Non colonnaire, pas de types, pas de compression native. \\
+JSON & Rejet\'{e} & Volumineux, pas colonnaire. Id\'{e}al pour \textit{transport} (Kafka), pas pour \textit{stockage} analytique. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Q16 : Architecture Medallion}
+
+Nous reprenons le pattern Bronze / Silver / Gold d\'{e}j\`{a} utilis\'{e} au Lab 2, adapt\'{e} au contexte streaming :
+
+\begin{center}
+\begin{tabular}{|l|p{4.8cm}|p{5cm}|}
+\hline
+\textbf{Couche} & \textbf{Contenu} & \textbf{Niveau de traitement} \\
+\hline
+\textbf{Bronze} & Ticks parses depuis Kafka, tels quels -- aucune suppression. & Fid\'{e}lit\'{e} totale \`{a} la source ; permet le \og replay\fg{} en cas de changement de r\`{e}gle m\'{e}tier. \\
+\hline
+\textbf{Silver} & Ticks apr\`{e}s le filtre d'outliers de la Part 3 (prix $> 0$, volume $\geq 0$, prix dans $[0.3\times, 3\times]$ de l'ancre). & Donn\'{e}es \og propres\fg{} pr\^{e}tes \`{a} consommer pour des analyses op\'{e}rationnelles. \\
+\hline
+\textbf{Gold} & Moyennes mobiles 1-min (glissement 10~s) par symbole, \textit{finalis\'{e}es} apr\`{e}s passage du watermark. & Agr\'{e}gats m\'{e}tier directement consommables par Superset ou un notebook d'analyse. \\
+\hline
+\end{tabular}
+\end{center}
+
+La couche Bronze utilise le sink Parquet en mode \texttt{append} sur les ticks bruts. La couche Silver fait pareil sur les ticks filtr\'{e}s. La couche Gold est l\'{e}g\`{e}rement plus subtile : en streaming, l'\'{e}criture Parquet ne supporte que le mode \texttt{append}, ce qui impose que les agr\'{e}gats fen\^{e}tr\'{e}s soient \textit{d\'{e}finitifs} avant \'{e}criture. Le watermark garantit cette finalisation -- une fen\^{e}tre $[t, t+1\text{min}]$ est \'{e}crite une et une seule fois lorsque l'horloge \'{e}v\'{e}nementielle d\'{e}passe $t + 1\text{min} + 2\text{min watermark}$.
+
+\begin{lstlisting}[style=code, language=Python, caption=Les 3 writeStream vers HDFS]
+HDFS = "hdfs://namenode:9000/lab3"
+
+q_bronze = (parsed.writeStream
+    .format("parquet")
+    .option("path",               f"{HDFS}/bronze/ticks")
+    .option("checkpointLocation", f"{HDFS}/checkpoints/bronze")
+    .partitionBy("ingest_date")
+    .outputMode("append")
+    .trigger(processingTime="20 seconds")
+    .start())
+
+q_silver = (clean.writeStream
+    .format("parquet")
+    .option("path",               f"{HDFS}/silver/ticks")
+    .option("checkpointLocation", f"{HDFS}/checkpoints/silver")
+    .partitionBy("ingest_date", "symbol")
+    .outputMode("append")
+    .trigger(processingTime="20 seconds")
+    .start())
+
+q_gold = (moving_avg.writeStream
+    .format("parquet")
+    .option("path",
+      f"{HDFS}/gold/moving_avg")
+    .option("checkpointLocation",
+      f"{HDFS}/checkpoints/gold_moving_avg")
+    .partitionBy("window_date")
+    .outputMode("append")
+    .trigger(processingTime="30 seconds")
+    .start())
+\end{lstlisting}
+
+\subsection{Q17 : Strat\'{e}gie de partitionnement}
+
+Chaque couche a une strat\'{e}gie de partitionnement adapt\'{e}e \`{a} ses requ\^{e}tes typiques~:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Bronze} -- partitionn\'{e} par \texttt{ingest\_date}. Cas d'usage principal : reprocesser \og hier\fg{} ou \og cette semaine\fg{}. Pas de partition par symbole ici -- en amont on ne sait pas encore si un tick est valide, et multiplier les partitions ajouterait de la fragmentation inutile.
+    \item \textbf{Silver} -- partitionn\'{e} par \texttt{ingest\_date} puis par \texttt{symbol}. La plupart des analyses filtrent sur un symbole pr\'{e}cis (\og \'{e}volution de BTCUSDT sur le 2026-04-23\fg{}). Avoir \texttt{symbol=} dans le path permet \`{a} Spark de \textbf{skipper} enti\`{e}rement les r\'{e}pertoires des autres symboles.
+    \item \textbf{Gold} -- partitionn\'{e} par \texttt{window\_date}. Les agr\'{e}gats sont relativement petits et le discriminant dominant reste temporel.
+\end{itemize}
+
+Structure observ\'{e}e dans HDFS apr\`{e}s 200~s de flux~:
+
+\begin{lstlisting}[style=code]
+/lab3/bronze/ticks/
+  _spark_metadata/...
+  ingest_date=2026-04-23/
+    part-00000-*.snappy.parquet
+    part-00001-*.snappy.parquet
+    ...
+
+/lab3/silver/ticks/
+  _spark_metadata/...
+  ingest_date=2026-04-23/
+    symbol=BTCUSDT/ part-*.snappy.parquet
+    symbol=ETHUSDT/ part-*.snappy.parquet
+    symbol=SOLUSDT/ part-*.snappy.parquet
+    symbol=BNBUSDT/ part-*.snappy.parquet
+    symbol=ADAUSDT/ part-*.snappy.parquet
+
+/lab3/gold/moving_avg/
+  _spark_metadata/...
+  window_date=2026-04-23/
+    part-*.snappy.parquet
+\end{lstlisting}
+
+V\'{e}rification c\^{o}t\'{e} Spark : la lecture batch des trois couches renvoie bien les volumes attendus~:
+\begin{center}
+\begin{tabular}{|l|r|l|}
+\hline
+\textbf{Couche} & \textbf{Lignes} & \textbf{Commentaire} \\
+\hline
+Bronze & 160 & tous les ticks parsés (5 symboles $\times$ $\sim$32 it\'{e}rations) \\
+Silver & 160 & aucun outlier d\'{e}tect\'{e} pendant ce test (march\'{e} calme) \\
+Gold & 5 & fen\^{e}tres d\'{e}j\`{a} finalis\'{e}es par le watermark \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Note op\'{e}rationnelle : le probl\`{e}me des petits fichiers.} Chaque micro-batch de Structured Streaming cr\'{e}e un nouveau fichier Parquet ($\sim$1.8~Ko chacun dans nos tests). Sur le long terme, HDFS pr\'{e}f\`{e}re des fichiers de $\sim$128~Mo (taille d'un bloc). En production, on planifie un job de \textbf{compactage} p\'{e}riodique (quotidien) qui lit les petits fichiers d'une partition et les r\'{e}\'{e}crit en un fichier unique. Ce job est hors scope pour ce lab mais est \`{a} pr\'{e}voir pour un d\'{e}ploiement r\'{e}el.
+
+\subsection{Q18 : Avantages du partitionnement et des formats colonnaires}
+
+\textbf{Partitionnement.} D\'{e}coupe physiquement le jeu de donn\'{e}es selon une ou plusieurs colonnes, en cr\'{e}ant un r\'{e}pertoire par valeur. Avantages concrets :
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Partition pruning} -- une requ\^{e}te \texttt{WHERE ingest\_date = '2026-04-23' AND symbol = 'BTCUSDT'} va lire \textit{uniquement} le r\'{e}pertoire \texttt{ingest\_date=2026-04-23/symbol=BTCUSDT/}. Les autres sont compl\`{e}tement ignor\'{e}s. Gain proportionnel au nombre de partitions \'{e}cart\'{e}es.
+    \item \textbf{Parall\'{e}lisation naturelle} -- chaque partition peut \^{e}tre lue par un worker diff\'{e}rent, sans coordination.
+    \item \textbf{Rejouabilit\'{e}} -- on peut purger, recalculer ou r\'{e}importer une partition (\og hier uniquement\fg{}) sans toucher au reste.
+    \item \textbf{Ind\'{e}pendance des \'{e}tapes ETL} -- un job qui \'{e}crit la partition du 23 avril ne bloque pas un job qui lit la partition du 22 avril.
+\end{itemize}
+
+\textbf{Pi\`{e}ge}~: partitionner sur une colonne \`{a} haute cardinalit\'{e} (par exemple \texttt{timestamp} \`{a} la milliseconde) produirait des millions de minuscules fichiers et d\'{e}graderait les performances. La r\`{e}gle pratique est de choisir une ou deux colonnes naturelles \`{a} cardinalit\'{e} $\leq$ quelques centaines de valeurs distinctes -- comme \texttt{ingest\_date} et \texttt{symbol}.
+
+\textbf{Formats colonnaires (Parquet / ORC).} Le stockage colonnaire stocke les valeurs d'une m\^{e}me colonne contigument sur disque. Avantages :
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Projection} -- une requ\^{e}te qui ne r\'{e}clame que \texttt{symbol, price} lit deux colonnes au lieu de toutes. Gain proportionnel \`{a} 1 - (colonnes lues / colonnes totales).
+    \item \textbf{Compression sup\'{e}rieure} -- des valeurs similaires (des prix, des symboles) se compressent beaucoup mieux c\^{o}te-\`{a}-c\^{o}te que m\'{e}lang\'{e}es.
+    \item \textbf{Predicate pushdown / statistiques} -- Parquet stocke min/max/null\_count par row-group. Spark utilise ces stats pour sauter des blocs entiers sans les lire (\og tous les \texttt{price} de ce bloc sont $< 100$, inutile de le d\'{e}compresser si on cherche $> 1000$\fg{}).
+    \item \textbf{Encodages dict/RLE} -- Parquet remplace automatiquement les colonnes \`{a} faible cardinalit\'{e} (ex. \texttt{symbol}) par un dictionnaire + indices, r\'{e}duisant drastiquement la taille.
+\end{itemize}
+
+La combinaison \textbf{partitionnement + colonnaire + predicate pushdown} est ce qui rend Spark rapide sur des volumes que des outils row-based (MySQL, JSON, CSV\dots) peineraient \`{a} charger.
+
+%---------------------------------------------------------------
+\section{PART 5 -- Kafka Streaming Behavior}
+%---------------------------------------------------------------
+
+Le notebook \texttt{notebooks/05\_streaming\_behavior.ipynb} regroupe trois d\'{e}monstrations~: (i) inspection des offsets et consumer groups, (ii) mesure de la latence end-to-end, (iii) sc\'{e}narios de panne (broker Kafka, job Spark).
+
+\subsection{Q19 : Gestion des offsets et consumer groups}
+
+\textbf{Offsets.} Chaque message dans une partition Kafka re\c{c}oit un \textbf{entier monotone croissant} (0, 1, 2\dots) appel\'{e} \textit{offset}. La position d'un consommateur est enti\`{e}rement d\'{e}crite par le triplet \texttt{(topic, partition, offset)}. Kafka lui-m\^{e}me ne d\'{e}place jamais l'offset : c'est le consommateur qui choisit jusqu'o\`{u} il a lu et \og commit\fg{} cette position.
+
+\textbf{Consumer groups.} Un \textit{group ID} est une cha\^{i}ne arbitraire qui lie plusieurs processus consommateurs entre eux. Au sein d'un m\^{e}me groupe, Kafka assigne chaque partition \`{a} \textbf{exactement un} membre -- ce qui permet la parall\'{e}lisation horizontale. Plusieurs groupes diff\'{e}rents sur le m\^{e}me topic re\c{c}oivent chacun \textbf{tout} le flux ind\'{e}pendamment.
+
+\textbf{Sp\'{e}cificit\'{e} de Spark Structured Streaming.} Spark utilise un group ID auto-g\'{e}n\'{e}r\'{e} de la forme \texttt{spark-kafka-source-<uuid>-driver-0} \textbf{par requ\^{e}te streaming} et \textit{ne commit pas} les offsets dans Kafka -- il les stocke dans le \texttt{checkpointLocation}, car Spark veut une s\'{e}mantique exactly-once que les commits Kafka seuls ne peuvent pas garantir. Cons\'{e}quence pratique~: dans l'UI Kafka (\texttt{localhost:8085}), les consumer groups Spark n'apparaissent que tant que la query est active et disparaissent imm\'{e}diatement apr\`{e}s un \texttt{q.stop()}.
+
+Inspection programmatique via \texttt{kafka-python}~:
+\begin{lstlisting}[style=code, language=Python, caption=Lister les groupes et leurs offsets]
+from kafka import KafkaAdminClient
+admin = KafkaAdminClient(bootstrap_servers="kafka:9092")
+groups = admin.list_consumer_groups()
+for gid, _ in groups:
+    offsets = admin.list_consumer_group_offsets(gid)
+    for tp, meta in offsets.items():
+        print(gid, tp.partition, meta.offset)
+\end{lstlisting}
+
+\subsection{Q20 : Simulation de nouvelles donn\'{e}es entrantes}
+
+Le producteur \texttt{02\_producer\_binance.ipynb} d\'{e}j\`{a} construit en Part 2 sert exactement de simulateur~: chaque ex\'{e}cution de la boucle pousse 5 nouveaux messages dans le topic toutes les 5~s. Avec Kafka UI ouvert (\texttt{localhost:8085}, onglet \textit{Topics $\rightarrow$ financial\_data $\rightarrow$ Messages}), on observe les nouveaux messages arriver en temps r\'{e}el. Sans relancer aucun consommateur, on peut faire varier dynamiquement~:
+\begin{itemize}[leftmargin=2em]
+    \item l'intervalle (\texttt{POLL\_INTERVAL\_SECONDS}) -- pour stresser le pipeline,
+    \item la liste des symboles (\texttt{SYMBOLS}) -- pour observer le partitionnement par cl\'{e}.
+\end{itemize}
+
+\subsection{Q21 : R\'{e}activit\'{e} et latence du pipeline}
+
+Pour mesurer pr\'{e}cis\'{e}ment la latence, on compare \textbf{trois horodatages} qui existent naturellement sur chaque message~:
+
+\begin{center}
+\begin{tabular}{|l|p{8.3cm}|}
+\hline
+\textbf{Horodatage} & \textbf{Sens} \\
+\hline
+\texttt{event\_time} & Champ \texttt{closeTime} renvoy\'{e} par Binance dans la r\'{e}ponse JSON. \\
+\texttt{kafka\_ts} & Auto-injectt\'{e} par le broker quand il accepte le message. \\
+\texttt{now} = \texttt{current\_timestamp()} & Heure courante c\^{o}t\'{e} Spark au moment du micro-batch. \\
+\hline
+\end{tabular}
+\end{center}
+
+On en d\'{e}duit deux latences ind\'{e}pendantes~:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{kafka\_to\_spark\_s} = \texttt{now} $-$ \texttt{kafka\_ts} : le temps qui s\'{e}pare l'acceptation par le broker de l'observation par Spark. \textbf{C'est la latence pipeline qu'on contr\^{o}le.} Mesur\'{e}e \`{a} \textbf{2--4 secondes}, born\'{e}e par notre trigger de 5~s.
+    \item \texttt{api\_freshness\_s} = \texttt{kafka\_ts} $-$ \texttt{event\_time} : la fra\^{i}cheur des donn\'{e}es upstream. C'est une propri\'{e}t\'{e} de l'API Binance, pas du pipeline. Pour le endpoint \texttt{/ticker/24hr}, le \texttt{closeTime} est l'horodatage du dernier trade dans la fen\^{e}tre rolling 24h, qui peut occasionnellement \^{e}tre tr\`{e}s ancien pour des symboles peu liquides.
+\end{itemize}
+
+Sortie observ\'{e}e (extrait)~:
+\begin{lstlisting}[style=code]
++-------+-----+-----------------+----------------+----------------+
+|symbol |price|kafka_ts         |kafka_to_spark_s|api_freshness_s |
++-------+-----+-----------------+----------------+----------------+
+|BTCUSDT|78235|21:08:07.547     |3               |3603            |
+|ETHUSDT|2367 |21:08:07.441     |3               |3606            |
+|SOLUSDT|86.87|21:08:07.565     |3               |3607            |
++-------+-----+-----------------+----------------+----------------+
+\end{lstlisting}
+
+\textbf{Verdict.} Le pipeline est \textbf{quasi-temps r\'{e}el} (\textit{near-real-time}, sous-5~s end-to-end), mais pas \textit{low-latency-trading} (microsecondes). Pour gagner un ordre de grandeur, on remplacerait le polling REST par un abonnement WebSocket \texttt{wss://stream.binance.com:9443/ws/btcusdt@trade} -- documentation pr\'{e}vue mais hors scope.
+
+\subsection{Q22 : Sc\'{e}narios de panne}
+
+\textbf{A. Crash du broker Kafka.} Simul\'{e} en arr\^{e}tant simplement le conteneur depuis l'h\^{o}te~:
+\begin{lstlisting}[style=code, language=bash]
+docker stop lab3-kafka      # le broker disparait
+# attendre quelques secondes -- les producteurs/consommateurs tentent de reconnecter
+docker start lab3-kafka     # le broker revient
+\end{lstlisting}
+\textbf{Comportement observ\'{e} :}
+\begin{itemize}[leftmargin=2em]
+    \item Le producteur Spark ou \texttt{kafka-python} \textbf{bufferise en m\'{e}moire} et \textbf{retente} automatiquement (\texttt{retries=N}). Avec \texttt{acks=all}, aucun message n'est perdu tant que le broker revient avant saturation du buffer.
+    \item Le consommateur Spark continue son micro-batch courant, puis re\c{c}oit une exception \`{a} la prochaine tentative de fetch ; sa logique de reprise (via \texttt{checkpointLocation}) permet de poursuivre depuis le dernier offset commit\'{e} d\`{e}s le retour du broker.
+    \item \textbf{Limite de notre lab :} un seul broker, \texttt{replication-factor=1}. Si on perd la donn\'{e}e disque du broker, c'est irr\'{e}cup\'{e}rable. En production, on utilise 3 brokers et \texttt{replication-factor=3} -- la perte d'un broker est transparente.
+\end{itemize}
+
+\textbf{B. Crash du job Spark.} Simul\'{e} en tuant le processus Python du consommateur~:
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-jupyter pkill -f spark
+\end{lstlisting}
+\textbf{Comportement observ\'{e}.} Au red\'{e}marrage du m\^{e}me notebook, Spark inspecte le \texttt{checkpointLocation}, trouve le dernier offset Kafka commit\'{e}, recharge l'\'{e}tat des agr\'{e}gats depuis le \textit{state store}, et reprend exactement l\`{a} o\`{u} il s'\'{e}tait arr\^{e}t\'{e}. La structure du checkpoint est lisible directement~:
+\begin{lstlisting}[style=code]
+/tmp/lab3_ckpt_recovery/
+  metadata                  (id de la query)
+  offsets/0, offsets/1, ... (offsets Kafka batch par batch)
+  commits/0, commits/1, ... (m\'{e}tadonn\'{e}es de commit)
+  sources/0/0               (info sur la source)
+  state/...                 (state store des agr\'{e}gats, si applicable)
+\end{lstlisting}
+
+\textbf{Garanties effectives :}
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Exactly-once} pour le calcul des agr\'{e}gats (state store transactionnel),
+    \item \textbf{At-least-once} pour la livraison vers un sink non-transactionnel (console, Parquet) -- d'o\`{u} l'usage de \texttt{dropDuplicates} en aval si une garantie stricte est requise.
+\end{itemize}
+
+\subsection{Note op\'{e}rationnelle : reproductibilit\'{e} de Kafka entre red\'{e}marrages}
+
+Au cours de nos tests, nous avons constat\'{e} que les \textbf{topics Kafka et leurs messages disparaissaient} apr\`{e}s un \texttt{docker-compose down/up}. Deux causes \`{a} traiter pour que le prof retrouve l'environnement op\'{e}rationnel \`{a} la simple commande \texttt{docker-compose up -d} :
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Volume persistant pour Kafka.} Sans volume mont\'{e}, le r\'{e}pertoire \texttt{/var/lib/kafka/data} (logs et offsets) vit dans la couche \'{e}criture du conteneur, qui est d\'{e}truite avec lui. Nous avons ajout\'{e} un volume Docker nomm\'{e} \texttt{kafka\_data} pour conserver l'\'{e}tat~:
+\begin{lstlisting}[style=code, language=bash]
+kafka:
+  ...
+  volumes:
+    - kafka_data:/var/lib/kafka/data
+
+volumes:
+  kafka_data:
+\end{lstlisting}
+    \item \textbf{Service \texttt{kafka-init} idempotent.} La cr\'{e}ation manuelle du topic via \texttt{kafka-topics --create} (Part 1, Q4) est non-reproductible. Nous avons ajout\'{e} un service \og one-shot\fg{} qui attend que Kafka soit pr\^{e}t puis cr\'{e}e le topic avec \texttt{--if-not-exists}~:
+\begin{lstlisting}[style=code, language=bash]
+kafka-init:
+  image: confluentinc/cp-kafka:7.5.0
+  depends_on: [kafka]
+  command: >
+    bash -c "
+      until kafka-topics --bootstrap-server kafka:9092 --list \
+            >/dev/null 2>&1; do sleep 2; done;
+      kafka-topics --bootstrap-server kafka:9092 \
+        --create --if-not-exists --topic financial_data \
+        --partitions 3 --replication-factor 1 \
+        --config retention.ms=604800000;
+    "
+  restart: "no"
+\end{lstlisting}
+\end{enumerate}
+
+Avec ces deux ajouts, la commande \texttt{docker-compose up -d} suffit \`{a} retrouver un environnement complet et fonctionnel apr\`{e}s tout red\'{e}marrage.
+
+%---------------------------------------------------------------
+\section{PART 6 -- Visualization with Superset}
+%---------------------------------------------------------------
+
+Pour exposer les donn\'{e}es de notre data lake \`{a} Superset, nous avons besoin d'un \textit{moteur SQL} qui sache lire le Parquet directement depuis HDFS. Trois options canoniques existent~: \textbf{Hive Server 2}, \textbf{Trino/Presto}, et \textbf{Spark Thrift Server}. Nous avons retenu la troisi\`{e}me.
+
+\subsection{Q23 : Exposition des donn\'{e}es HDFS via Spark Thrift Server}
+
+\textbf{Pourquoi Spark Thrift plut\^{o}t que Hive ou Trino ?}
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Coh\'{e}rence avec le reste de la stack} -- nous avons d\'{e}j\`{a} Spark 3.5.0 dans le projet ; le Thrift Server est livr\'{e} avec la m\^{e}me distribution Spark, donc aucun nouveau moteur \`{a} maintenir.
+    \item \textbf{M\^{e}me dialecte SQL} que dans nos notebooks -- pas de surprise quand on porte une requ\^{e}te du notebook vers Superset.
+    \item \textbf{Supporte le Parquet partitionn\'{e}} nativement, sans n\'{e}cessiter un Hive Metastore externe (utilise un Derby embarqu\'{e}).
+\end{itemize}
+
+Service Docker ajout\'{e}~:
+
+\begin{lstlisting}[style=code, language=bash, caption=Service spark-thrift dans docker-compose.yml]
+spark-thrift:
+  image: apache/spark:3.5.0
+  container_name: lab3-spark-thrift
+  depends_on: [spark-master, namenode]
+  ports: ["10000:10000"]
+  user: root
+  command: >
+    bash -c "
+    /opt/spark/sbin/start-thriftserver.sh \
+      --master spark://spark-master:7077 \
+      --hiveconf hive.server2.thrift.port=10000 \
+      --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
+      --conf spark.sql.warehouse.dir=hdfs://namenode:9000/lab3/warehouse \
+      --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+    && tail -f /opt/spark/logs/*"
+\end{lstlisting}
+
+Le Thrift Server expose le protocole \textbf{HiveServer2} sur le port \texttt{10000}, accessible :
+\begin{itemize}[leftmargin=2em]
+    \item depuis les conteneurs sur le r\'{e}seau \texttt{lab3} via \texttt{spark-thrift:10000} ;
+    \item depuis l'h\^{o}te via \texttt{localhost:10000} -- pratique pour DBeaver, Beeline, ou tout autre client JDBC.
+\end{itemize}
+
+\textbf{V\'{e}rification rapide} via Beeline (le client SQL en ligne de commande livr\'{e} avec Spark) :
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-spark-thrift /opt/spark/bin/beeline \
+  -u "jdbc:hive2://localhost:10000" -n spark \
+  -e "SHOW DATABASES;"
+# +------------+
+# | namespace  |
+# +------------+
+# | default    |
+# +------------+
+\end{lstlisting}
+
+\textbf{Enregistrement des couches Parquet comme tables externes.} Une fois le Thrift Server pr\^{e}t et apr\`{e}s avoir produit au moins quelques fichiers Parquet via le notebook \texttt{04\_hdfs\_medallion.ipynb}, on ex\'{e}cute le script \texttt{scripts/setup\_thrift\_tables.sql}~:
+
+\begin{lstlisting}[style=code, language=SQL, caption=setup\_thrift\_tables.sql]
+CREATE TABLE IF NOT EXISTS bronze_ticks
+USING parquet
+LOCATION 'hdfs://namenode:9000/lab3/bronze/ticks';
+
+CREATE TABLE IF NOT EXISTS silver_ticks
+USING parquet
+LOCATION 'hdfs://namenode:9000/lab3/silver/ticks';
+
+CREATE TABLE IF NOT EXISTS gold_moving_avg
+USING parquet
+LOCATION 'hdfs://namenode:9000/lab3/gold/moving_avg';
+\end{lstlisting}
+
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-spark-thrift /opt/spark/bin/beeline \
+  -u "jdbc:hive2://localhost:10000" -n spark \
+  -f /opt/scripts/setup_thrift_tables.sql
+\end{lstlisting}
+
+Spark d\'{e}duit automatiquement le sch\'{e}ma et les colonnes de partition \`{a} partir des fichiers Parquet d\'{e}j\`{a} pr\'{e}sents dans HDFS. Une simple v\'{e}rification confirme que tout est queryable~:
+
+\begin{lstlisting}[style=code, language=SQL]
+> SELECT symbol, AVG(price), COUNT(*)
+  FROM silver_ticks GROUP BY symbol;
++----------+--------------------+-----+
+|  symbol  |     avg_price      |  n  |
++----------+--------------------+-----+
+| SOLUSDT  | 85.428             | 32  |
+| ADAUSDT  | 0.246              | 32  |
+| BNBUSDT  | 631.69             | 32  |
+| ETHUSDT  | 2314.60            | 32  |
+| BTCUSDT  | 77428.91           | 32  |
++----------+--------------------+-----+
+\end{lstlisting}
+
+\subsection{Q24 : Configuration de Superset et cr\'{e}ation des datasets}
+
+Superset parle au Spark Thrift via SQLAlchemy + le pilote \texttt{PyHive}. La cha\^{i}ne de connexion utilis\'{e}e est~:
+
+\begin{lstlisting}[style=code]
+hive://hive@spark-thrift:10000/default?auth=NONE
+\end{lstlisting}
+
+\texttt{auth=NONE} indique que Spark Thrift utilise SASL en mode \og NONE\fg{} (pas de Kerberos). Le username \texttt{hive} est arbitraire (Spark Thrift ne v\'{e}rifie pas l'authentification dans cette configuration de lab).
+
+Plut\^{o}t que de demander au prof de cliquer manuellement dans l'UI Superset pour cr\'{e}er la connexion et les datasets, nous avons \'{e}crit un script \texttt{scripts/provision\_superset.py} qui s'en charge via l'API REST de Superset~:
+
+\begin{lstlisting}[style=code, language=Python, caption=provision\_superset.py (extrait)]
+SQLALCHEMY_URI = "hive://hive@spark-thrift:10000/default?auth=NONE"
+
+# 1. Cr\'eer la connexion DB
+requests.post(f"{SUPERSET}/api/v1/database/", json={
+    "database_name": "Spark SQL",
+    "sqlalchemy_uri": SQLALCHEMY_URI,
+    "expose_in_sqllab": True,
+}, headers={...})
+
+# 2. Cr\'eer un dataset par table
+for table in ["bronze_ticks", "silver_ticks", "gold_moving_avg"]:
+    requests.post(f"{SUPERSET}/api/v1/dataset/", json={
+        "database": db_id,
+        "schema": "default",
+        "table_name": table,
+    }, headers={...})
+\end{lstlisting}
+
+Le script est \textbf{idempotent}~: il met \`{a} jour la connexion existante et saute les datasets d\'{e}j\`{a} cr\'{e}\'{e}s. Ex\'{e}cution~:
+
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-superset python /opt/scripts/provision_superset.py
+# Provisioning complete.
+#  - Database: 'Spark SQL'
+#  - Datasets: bronze_ticks, silver_ticks, gold_moving_avg
+\end{lstlisting}
+
+\subsection{Q25 : Construction des dashboards}
+
+Les datasets \'{e}tant en place, on peut construire les graphiques directement dans l'UI Superset (\texttt{localhost:8088}, login \texttt{admin}/\texttt{admin}). Trois graphiques cl\'{e}s sont demand\'{e}s par l'\'{e}nonc\'{e} ; voici la configuration recommand\'{e}e pour chacun~:
+
+\begin{center}
+\begin{tabular}{|p{3.2cm}|p{4.3cm}|p{6cm}|}
+\hline
+\textbf{Graphique} & \textbf{Type Superset} & \textbf{Configuration} \\
+\hline
+\textbf{Price evolution over time} & Time-series Line Chart & Dataset~: \texttt{silver\_ticks}. Time column~: \texttt{event\_time}. Metric~: \texttt{AVG(price)}. Group by~: \texttt{symbol}. Time grain~: \texttt{1 minute}. \\
+\hline
+\textbf{Volume trends} & Time-series Bar Chart (ou Area) & Dataset~: \texttt{silver\_ticks}. Metric~: \texttt{SUM(volume)}. Group by~: \texttt{symbol}. Time grain~: \texttt{5 minutes}. \\
+\hline
+\textbf{Moving averages} & Time-series Line Chart & Dataset~: \texttt{gold\_moving\_avg}. Time column~: \texttt{window\_start}. Metric~: \texttt{AVG(avg\_price)}. Group by~: \texttt{symbol}. \\
+\hline
+\end{tabular}
+\end{center}
+
+Tous trois sont ensuite assembl\'{e}s dans un \textbf{Dashboard} via le bouton \og + Dashboard\fg{} de l'UI, avec un filtre de symbole partag\'{e} en haut pour permettre \`{a} l'utilisateur de comparer les actifs.
+
+\subsection{Q26 : Choix du type de graphique selon l'analyse}
+
+\begin{center}
+\begin{tabular}{|p{3.5cm}|p{4cm}|p{6cm}|}
+\hline
+\textbf{Question analytique} & \textbf{Graphique recommand\'{e}} & \textbf{Pourquoi} \\
+\hline
+S\'{e}rie temporelle & Time-series Line Chart & Met en \'{e}vidence la continuit\'{e} et la tendance ; l'\oe{}il humain suit naturellement une ligne. \\
+\hline
+Comparaison de cat\'{e}gories & Bar Chart (vertical ou horizontal) & Compare des valeurs discr\`{e}tes c\^{o}te \`{a} c\^{o}te ; la longueur des barres est facile \`{a} comparer pr\'{e}cis\'{e}ment. \\
+\hline
+Tendance / volume cumul\'{e} & Area Chart ou Stacked Area & La surface remplie traduit visuellement \og l'accumulation\fg{} ; pratique pour une somme par cat\'{e}gorie au cours du temps. \\
+\hline
+Distribution & Histogram, Box Plot & R\'{e}v\`{e}le l'asym\'{e}trie, les outliers, la dispersion -- impossible avec une simple moyenne. \\
+\hline
+Corr\'{e}lation entre 2 m\'{e}triques & Scatter Plot & Visualise la relation entre prix et volume par exemple. \\
+\hline
+KPI unique & Big Number (avec ou sans trend) & Pour des m\'{e}triques sentinelles affich\'{e}es en grand sur un dashboard exec. \\
+\hline
+\end{tabular}
+\end{center}
+
+\subsection{Note op\'{e}rationnelle : ordre d'ex\'{e}cution pour reproduire la Part 6}
+
+Pour que le prof obtienne un Superset op\'{e}rationnel, l'ordre suivant est requis~:
+\begin{enumerate}[leftmargin=2em]
+    \item \texttt{docker-compose up -d} -- d\'{e}marre tous les services dont \texttt{spark-thrift} et \texttt{superset}.
+    \item Lancer le notebook \texttt{02\_producer\_binance.ipynb} pour alimenter le topic Kafka.
+    \item Lancer le notebook \texttt{04\_hdfs\_medallion.ipynb} et le laisser tourner $\sim$3 min pour produire au moins quelques fichiers Parquet dans \texttt{/lab3/silver/} et \texttt{/lab3/gold/}.
+    \item Enregistrer les tables externes c\^{o}t\'{e} Spark Thrift~:
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-spark-thrift /opt/spark/bin/beeline \
+  -u "jdbc:hive2://localhost:10000" -n spark \
+  -f /opt/scripts/setup_thrift_tables.sql
+\end{lstlisting}
+    \item Provisionner Superset (datasets + connexion)~:
+\begin{lstlisting}[style=code, language=bash]
+docker exec lab3-superset \
+  python /opt/scripts/provision_superset.py
+\end{lstlisting}
+\end{enumerate}
+Apr\`{e}s ces 5 \'{e}tapes, on peut ouvrir \texttt{localhost:8088} et construire les dashboards directement.
+
+%---------------------------------------------------------------
+\section{PART 7 -- Multidimensional Analysis (Advanced)}
+%---------------------------------------------------------------
+
+Le notebook \texttt{notebooks/07\_multidimensional\_analysis.ipynb} contient toutes les requ\^{e}tes et constructions de cette partie. Toutes s'ex\'{e}cutent contre la couche \texttt{silver\_ticks} d\'{e}j\`{a} produite en Part 4.
+
+\subsection{Q27 : Prix moyen par symbole et par jour}
+
+\begin{lstlisting}[style=code, language=SQL]
+SELECT ingest_date,
+       symbol,
+       ROUND(AVG(price), 6) AS avg_price,
+       COUNT(*)             AS n_ticks
+FROM silver_ticks
+GROUP BY ingest_date, symbol
+ORDER BY ingest_date, symbol;
+\end{lstlisting}
+
+R\'{e}sultat observ\'{e}~:
+\begin{lstlisting}[style=code]
++-----------+-------+------------+---+
+|ingest_date|symbol |avg_price   |n  |
++-----------+-------+------------+---+
+|2026-04-23 |ADAUSDT|0.245959    |32 |
+|2026-04-23 |BNBUSDT|631.693125  |32 |
+|2026-04-23 |BTCUSDT|77428.907813|32 |
+|2026-04-23 |ETHUSDT|2314.602187 |32 |
+|2026-04-23 |SOLUSDT|85.428125   |32 |
++-----------+-------+------------+---+
+\end{lstlisting}
+
+\subsection{Q28 : Symbole le plus volatile}
+
+Comparer directement l'\'{e}cart-type du prix entre BTC ($\sim$\$77000) et ADA ($\sim$\$0.25) n'a pas de sens (les deux sont sur des \'{e}chelles incomparables). On utilise donc le \textbf{coefficient de variation} (CV~=~\'{e}cart-type / moyenne, exprim\'{e} en \%) qui normalise la dispersion par le niveau de prix~:
+
+\begin{lstlisting}[style=code, language=SQL]
+SELECT symbol,
+       ROUND(AVG(price), 6)              AS mean_price,
+       ROUND(STDDEV_SAMP(price), 6)      AS stddev_price,
+       ROUND(STDDEV_SAMP(price)
+             / AVG(price) * 100, 4)      AS cv_pct
+FROM silver_ticks
+GROUP BY symbol
+ORDER BY cv_pct DESC;
+\end{lstlisting}
+
+\begin{lstlisting}[style=code]
++-------+------------+------------+------+
+|symbol |mean_price  |stddev_price|cv_pct|
++-------+------------+------------+------+
+|SOLUSDT|85.428125   |0.035235    |0.0412|
+|ADAUSDT|0.245959    |8.7E-5      |0.0356|
+|BTCUSDT|77428.907813|25.722947   |0.0332|
+|ETHUSDT|2314.602187 |0.745463    |0.0322|
+|BNBUSDT|631.693125  |0.147549    |0.0234|
++-------+------------+------------+------+
+\end{lstlisting}
+
+Sur cet \'{e}chantillon (couvrant quelques minutes seulement), \textbf{SOLUSDT} a le CV le plus \'{e}lev\'{e}, donc le mouvement de prix relatif le plus prononc\'{e}. Sur un \'{e}chantillon plus long les classements peuvent changer ; la m\'{e}thodologie reste la m\^{e}me.
+
+\subsection{Q29 : Heures de pointe (peak trading hours)}
+
+\begin{lstlisting}[style=code, language=SQL]
+SELECT HOUR(event_time)             AS hour_utc,
+       COUNT(*)                     AS n_ticks,
+       ROUND(SUM(volume), 2)        AS total_volume
+FROM silver_ticks
+GROUP BY HOUR(event_time)
+ORDER BY total_volume DESC;
+\end{lstlisting}
+
+Sur des donn\'{e}es de 24h, ce graphique r\'{e}v\`{e}lerait typiquement deux \og bosses\fg{} correspondant aux ouvertures successives des march\'{e}s asiatiques, europ\'{e}ens, puis am\'{e}ricains. Sur l'\'{e}chantillon court de notre lab, l'heure 11 UTC domine simplement parce que le test a tourn\'{e} pendant cet intervalle.
+
+\subsection{Q30 : ROLLUP et CUBE}
+
+Spark SQL impl\'{e}mente les deux op\'{e}rateurs OLAP standard pour produire des \textbf{sous-totaux multi-niveaux} en une seule passe.
+
+\textbf{ROLLUP -- hi\'{e}rarchie ordonn\'{e}e.} \texttt{ROLLUP(ingest\_date, symbol)} g\'{e}n\`{e}re trois niveaux : par \texttt{(date, symbole)}, par \texttt{(date)} (toutes paires d'un jour confondues), et le \textbf{grand total} (toutes lignes). Les niveaux agr\'{e}g\'{e}s ont des \texttt{NULL} dans les colonnes \og roll\'{e}es\fg{}.
+
+\begin{lstlisting}[style=code, language=SQL]
+SELECT ingest_date, symbol, ROUND(SUM(volume), 2) AS total_volume
+FROM silver_ticks
+GROUP BY ROLLUP(ingest_date, symbol)
+ORDER BY ingest_date NULLS LAST, symbol NULLS LAST;
+\end{lstlisting}
+
+\begin{lstlisting}[style=code]
++-----------+-------+----------------+
+|ingest_date|symbol |total_volume    |
++-----------+-------+----------------+
+|2026-04-23 |ADAUSDT|3.623403051E9   |   <- niveau (date, sym)
+|2026-04-23 |BNBUSDT|3990725.87      |
+|2026-04-23 |BTCUSDT|588691.8        |
+|2026-04-23 |ETHUSDT|1.200019716E7   |
+|2026-04-23 |SOLUSDT|8.308069275E7   |
+|2026-04-23 |NULL   |3.72306335858E9 |   <- sous-total par jour
+|NULL       |NULL   |3.72306335858E9 |   <- grand total
++-----------+-------+----------------+
+\end{lstlisting}
+
+\textbf{CUBE -- toutes les combinaisons.} \texttt{CUBE(ingest\_date, symbol)} ajoute le niveau \og par symbole, tous jours confondus\fg{} en plus de ce que produit ROLLUP. C'est utile quand l'utilisateur veut pivoter dans n'importe quelle direction sans avoir \`{a} relancer la requ\^{e}te.
+
+\begin{lstlisting}[style=code]
++-----------+-------+----------------+
+|ingest_date|symbol |total_volume    |
++-----------+-------+----------------+
+|2026-04-23 |ADAUSDT|3.623403051E9   |
+|2026-04-23 |...    |...             |
+|NULL       |ADAUSDT|3.623403051E9   |   <- ADA tous jours
+|NULL       |BNBUSDT|3990725.87      |
+|NULL       |BTCUSDT|588691.8        |
+|NULL       |ETHUSDT|1.200019716E7   |
+|NULL       |SOLUSDT|8.308069275E7   |
+|NULL       |NULL   |3.72306335858E9 |   <- grand total
++-----------+-------+----------------+
+\end{lstlisting}
+
+Cas d'usage pratique~: une dashboard \og finance\fg{} qui doit afficher \textit{simultan\'{e}ment} le total par symbole, le total par jour, et la grande somme -- sans relancer trois requ\^{e}tes.
+
+\subsection{Q31 : Mod\'{e}lisation en \'{e}toile (star schema)}
+
+Pour des analyses BI \`{a} grande \'{e}chelle, on \'{e}clate \texttt{silver\_ticks} en une \textbf{table de faits \'{e}troite et longue} et plusieurs \textbf{tables de dimensions courtes et larges}~:
+
+\begin{center}
+\begin{tabular}{|l|p{8cm}|}
+\hline
+\textbf{Table} & \textbf{R\^{o}le} \\
+\hline
+\texttt{fact\_ticks} & Faits / mesures : \texttt{price}, \texttt{volume}, plus 3 cl\'{e}s \'{e}trang\`{e}res \texttt{(time\_key, symbol\_key, market\_key)}. Partitionn\'{e}e par \texttt{ingest\_date}. Une ligne = un tick. \\
+\hline
+\texttt{dim\_time} & Calendrier : \texttt{time\_key} (timestamp), \texttt{year}, \texttt{month}, \texttt{day}, \texttt{hour}, \texttt{minute}, \texttt{weekday}. \\
+\hline
+\texttt{dim\_symbol} & Description des actifs : \texttt{symbol\_key}, \texttt{base\_asset} (ex. \texttt{BTC}), \texttt{quote\_asset} (ex. \texttt{USDT}). \\
+\hline
+\texttt{dim\_market} & Description du march\'{e} : \texttt{market\_key}, \texttt{exchange}, \texttt{venue\_type}, \texttt{settlement\_currency}. Une seule ligne dans notre lab car nous ne consommons que Binance Spot. \\
+\hline
+\end{tabular}
+\end{center}
+
+\textbf{Construction.} La fact table est obtenue en remplaçant les colonnes descriptives de \texttt{silver\_ticks} par leurs cl\'{e}s \'{e}trang\`{e}res~:
+
+\begin{lstlisting}[style=code, language=Python]
+fact_ticks = silver.select(
+    col("event_time").alias("time_key"),       # FK -> dim_time
+    col("symbol").alias("symbol_key"),         # FK -> dim_symbol
+    lit("BINANCE_SPOT").alias("market_key"),   # FK -> dim_market
+    col("price"),
+    col("volume"),
+    col("ingest_date"),
+)
+fact_ticks.write.mode("overwrite") \
+    .partitionBy("ingest_date") \
+    .parquet("hdfs://namenode:9000/lab3/gold_star/fact_ticks")
+\end{lstlisting}
+
+Les trois dimensions sont construites une seule fois par \texttt{distinct} ou par cr\'{e}ation manuelle (pour \texttt{dim\_market}).
+
+\textbf{Pourquoi cette d\'{e}composition ?}
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Stockage} -- la fact table est large (millions de lignes \`{a} terme) ; en gardant les descriptions dans des dimensions courtes (5 lignes pour \texttt{dim\_symbol}), on \'{e}vite de r\'{e}p\'{e}ter \texttt{base\_asset} = \texttt{BTC} sur chacune des millions de lignes BTC.
+    \item \textbf{Performance des jointures} -- les cl\'{e}s sont des entiers ou des cha\^{i}nes courtes ; les dimensions tiennent enti\`{e}rement en m\'{e}moire (broadcast join) ; les filtres sur \texttt{ingest\_date} \'{e}liminent des partitions enti\`{e}res.
+    \item \textbf{Flexibilit\'{e}} -- ajouter un attribut \`{a} un symbole (par exemple un secteur, un \og market cap rank\fg{}) ne touche que \texttt{dim\_symbol}, pas la fact table.
+    \item \textbf{Standard BI} -- Superset, Tableau, Power BI sont tous con\c{c}us autour de ce sch\'{e}ma.
+\end{itemize}
+
+\textbf{Requ\^{e}te \'{e}toile typique.} Volume total par actif sous-jacent, par jour~:
+
+\begin{lstlisting}[style=code, language=SQL]
+SELECT f.ingest_date,
+       s.base_asset,
+       ROUND(SUM(f.volume), 2) AS total_volume,
+       COUNT(*)                AS n_ticks
+FROM fact_ticks f
+JOIN dim_symbol s ON f.symbol_key = s.symbol_key
+GROUP BY f.ingest_date, s.base_asset
+ORDER BY f.ingest_date, total_volume DESC;
+\end{lstlisting}
+
+R\'{e}sultat~:
+\begin{lstlisting}[style=code]
++-----------+----------+---------------+---+
+|ingest_date|base_asset|total_volume   |n  |
++-----------+----------+---------------+---+
+|2026-04-23 |ADA       |3.623403051E9  |32 |
+|2026-04-23 |SOL       |8.308069275E7  |32 |
+|2026-04-23 |ETH       |1.200019716E7  |32 |
+|2026-04-23 |BNB       |3990725.87     |32 |
+|2026-04-23 |BTC       |588691.8       |32 |
++-----------+----------+---------------+---+
+\end{lstlisting}
+
+Toutes les tables \'{e}toile sont \'{e}galement enregistr\'{e}es dans Spark Thrift via \texttt{setup\_thrift\_tables.sql} (mis \`{a} jour pour inclure \texttt{fact\_ticks}, \texttt{dim\_time}, \texttt{dim\_symbol}, \texttt{dim\_market}), donc directement utilisables depuis Superset.
+
+\subsection{Note op\'{e}rationnelle : MSCK REPAIR pour les tables partitionn\'{e}es}
+
+Lorsqu'une table externe Spark SQL est cr\'{e}\'{e}e avec \texttt{USING parquet LOCATION '\dots'} et que les fichiers Parquet ont \'{e}t\'{e} \'{e}crits avec \texttt{partitionBy(\dots)}, Spark Thrift voit la table mais retourne \textbf{0 ligne} tant que les partitions n'ont pas \'{e}t\'{e} d\'{e}couvertes. Il faut ex\'{e}cuter une fois~:
+
+\begin{lstlisting}[style=code, language=SQL]
+MSCK REPAIR TABLE fact_ticks;
+\end{lstlisting}
+
+Cette ligne a \'{e}t\'{e} ajout\'{e}e pour chaque table partitionn\'{e}e dans \texttt{setup\_thrift\_tables.sql}, ce qui assure que le prof obtient des donn\'{e}es queryables d\`{e}s la premi\`{e}re ex\'{e}cution du script.
+
+%---------------------------------------------------------------
+\section{Conclusion}
+%---------------------------------------------------------------
+
+Ce lab nous a permis de concevoir et impl\'{e}menter un pipeline \textbf{streaming} complet, en r\'{e}utilisant les briques du Lab 2 (HDFS, Spark, Medallion) et en y ajoutant la dimension temps r\'{e}el~:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Ingestion (Part 2)} -- producteur Spark qui poll Binance REST toutes les 5~s et publie en JSON sur Kafka.
+    \item \textbf{Stream processing (Part 3)} -- consommateur Spark Structured Streaming avec sch\'{e}ma strict, filtre d'outliers param\'{e}tr\'{e} par symbole, moyenne mobile fen\^{e}tr\'{e}e et agr\'{e}gation par symbole.
+    \item \textbf{Stockage (Part 4)} -- trois sinks Parquet partitionn\'{e}s sur HDFS impl\'{e}mentant l'architecture Medallion (Bronze / Silver / Gold), chacun avec son checkpoint.
+    \item \textbf{R\'{e}silience (Part 5)} -- mesure de la latence end-to-end ($\sim$2--4~s), strat\'{e}gies de tol\'{e}rance aux pannes c\^{o}t\'{e} producteur (acks, retries) et c\^{o}t\'{e} consommateur (checkpointLocation).
+    \item \textbf{Visualisation (Part 6)} -- Spark Thrift Server expose le data lake en SQL HiveServer2 ; Superset s'y connecte via PyHive et consomme les datasets.
+    \item \textbf{Analyse multidimensionnelle (Part 7)} -- requ\^{e}tes business (volatilit\'{e}, peak hours), op\'{e}rateurs OLAP (ROLLUP, CUBE), et mod\'{e}lisation en \'{e}toile mat\'{e}rialis\'{e}e dans \texttt{/lab3/gold\_star/}.
+\end{itemize}
+
+Le tout est packag\'{e} dans un \texttt{docker-compose.yml} de 12 services qui d\'{e}marre en une commande, avec un volume Kafka persistant et un service \texttt{kafka-init} idempotent qui assure que la commande \texttt{docker-compose up -d} suffit toujours \`{a} obtenir un environnement op\'{e}rationnel.
+
+\end{document}

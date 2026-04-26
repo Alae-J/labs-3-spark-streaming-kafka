@@ -1,0 +1,310 @@
+version: "3.8"
+
+services:
+
+  # ======================
+  # HDFS - NAMENODE
+  # ======================
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-namenode
+    hostname: namenode
+    environment:
+      - CLUSTER_NAME=lab3
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+    ports:
+      - "9870:9870"
+    volumes:
+      - namenode:/hadoop/dfs/name
+    networks:
+      - lab3
+
+  # ======================
+  # HDFS - DATANODE 1
+  # ======================
+  datanode1:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-datanode1
+    hostname: datanode1
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - SERVICE_PRECONDITION=namenode:9000
+    depends_on:
+      - namenode
+    volumes:
+      - datanode1:/hadoop/dfs/data
+    networks:
+      - lab3
+
+  # ======================
+  # HDFS - DATANODE 2
+  # ======================
+  datanode2:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: lab3-datanode2
+    hostname: datanode2
+    environment:
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - SERVICE_PRECONDITION=namenode:9000
+    depends_on:
+      - namenode
+    volumes:
+      - datanode2:/hadoop/dfs/data
+    networks:
+      - lab3
+
+  # ======================
+  # ZOOKEEPER (for Kafka)
+  # ======================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: lab3-zookeeper
+    hostname: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - lab3
+
+  # ======================
+  # KAFKA BROKER
+  # ======================
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: lab3-kafka
+    hostname: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # kafka:9092 is used by containers on the same docker network.
+      # localhost:29092 is used from the host machine.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - lab3
+
+  # ======================
+  # KAFKA INIT (one-shot: create the financial_data topic if missing)
+  # ======================
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: lab3-kafka-init
+    depends_on:
+      - kafka
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka broker...';
+        until kafka-topics --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do
+          sleep 2;
+        done;
+        echo 'Creating topic financial_data (idempotent)...';
+        kafka-topics --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic financial_data \
+          --partitions 3 --replication-factor 1 \
+          --config retention.ms=604800000;
+        echo 'Topic ready.';
+      "
+    networks:
+      - lab3
+    restart: "no"
+
+  # ======================
+  # KAFKA UI (debug / demo)
+  # ======================
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: lab3-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8085:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: lab3
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - lab3
+
+  # ======================
+  # SPARK MASTER
+  # ======================
+  spark-master:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-master
+    hostname: spark-master
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-master.sh &&
+      tail -f /opt/spark/logs/*"
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    networks:
+      - lab3
+
+  # ======================
+  # SPARK WORKER 1
+  # ======================
+  spark-worker1:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-worker1
+    hostname: spark-worker1
+    depends_on:
+      - spark-master
+    command: >
+      bash -c "
+      sleep 10 &&
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/*"
+    networks:
+      - lab3
+
+  # ======================
+  # SPARK WORKER 2
+  # ======================
+  spark-worker2:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-worker2
+    hostname: spark-worker2
+    depends_on:
+      - spark-master
+    command: >
+      bash -c "
+      sleep 10 &&
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/*"
+    networks:
+      - lab3
+
+  # ======================
+  # SPARK CLIENT (job submission + shell)
+  # ======================
+  spark-client:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-client
+    hostname: spark-client
+    stdin_open: true
+    tty: true
+    depends_on:
+      - spark-master
+      - namenode
+      - kafka
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./scripts:/opt/scripts
+    command: tail -f /dev/null
+    networks:
+      - lab3
+
+  # ======================
+  # JUPYTER LAB (notebook IDE w/ PySpark matching cluster version)
+  # ======================
+  jupyter:
+    image: jupyter/pyspark-notebook:spark-3.5.0
+    container_name: lab3-jupyter
+    hostname: jupyter
+    depends_on:
+      - spark-master
+      - kafka
+      - namenode
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./notebooks:/home/jovyan/work/notebooks
+      - ./scripts:/home/jovyan/work/scripts
+    environment:
+      JUPYTER_TOKEN: lab3
+      JUPYTER_ENABLE_LAB: "yes"
+      PYSPARK_PYTHON: python3
+    command: >
+      bash -c "pip install --quiet --user requests kafka-python findspark &&
+               start-notebook.sh --ServerApp.token='lab3' --ServerApp.password=''"
+    networks:
+      - lab3
+
+  # ======================
+  # SPARK THRIFT SERVER
+  # ----------------------
+  # Exposes Spark SQL via the HiveServer2 protocol on port 10000 so that
+  # external BI tools (Superset, Beeline, DBeaver) can query the HDFS
+  # Parquet layers (bronze/silver/gold) using plain SQL through JDBC.
+  # The Hive metastore is the embedded Derby DB inside the container --
+  # fine for a lab; production would point spark.sql.hive.metastore.* at
+  # an external Postgres/MySQL.
+  # ======================
+  spark-thrift:
+    image: apache/spark:3.5.0
+    container_name: lab3-spark-thrift
+    hostname: spark-thrift
+    depends_on:
+      - spark-master
+      - namenode
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./scripts:/opt/scripts
+    user: root
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-thriftserver.sh \
+        --master spark://spark-master:7077 \
+        --hiveconf hive.server2.thrift.port=10000 \
+        --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
+        --conf spark.sql.warehouse.dir=hdfs://namenode:9000/lab3/warehouse \
+        --conf spark.hadoop.fs.defaultFS=hdfs://namenode:9000 \
+      && tail -f /opt/spark/logs/*"
+    networks:
+      - lab3
+
+  # ======================
+  # SUPERSET (BI / dashboards)
+  # ======================
+  superset:
+    image: apache/superset:3.1.1
+    container_name: lab3-superset
+    hostname: superset
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./scripts:/opt/scripts
+    environment:
+      SUPERSET_SECRET_KEY: lab3-superset-local-secret-change-me
+      ADMIN_USERNAME: admin
+      ADMIN_EMAIL: admin@lab3.local
+      ADMIN_PASSWORD: admin
+    command: >
+      bash -c "
+      pip install --quiet 'pyhive[hive]' thrift thrift-sasl trino sqlalchemy-trino &&
+      superset db upgrade &&
+      superset fab create-admin --username admin --firstname Admin --lastname Lab3 --email admin@lab3.local --password admin || true &&
+      superset init &&
+      /usr/bin/run-server.sh"
+    networks:
+      - lab3
+
+volumes:
+  namenode:
+  datanode1:
+  datanode2:
+  kafka_data:
+
+networks:
+  lab3:
+    driver: bridge

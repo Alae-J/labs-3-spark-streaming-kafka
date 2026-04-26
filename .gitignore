@@ -1,0 +1,27 @@
+# Local IDE / tool settings
+.claude/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# LaTeX build artifacts (keep rapport.tex and rapport.pdf, ignore the rest)
+Rapport/*.aux
+Rapport/*.log
+Rapport/*.fls
+Rapport/*.fdb_latexmk
+Rapport/*.toc
+Rapport/*.out
+Rapport/*.nlo
+Rapport/*.synctex.gz
+Rapport/*.bbl
+Rapport/*.blg
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*~
